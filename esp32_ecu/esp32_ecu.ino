@@ -48,12 +48,16 @@ void processSerialCommand(const char* rawCmd) {
     } else if (c == 'w' || c == 'W') {
         OtaManager::startWiFi();
         return;
+    } else if (c == 's' || c == 'S') {
+        UartBridge::triggerSniffer(10);
+        return;
     } else if (c == 'h' || c == 'H' || c == '?') {
         Serial.println("\n[AYUDA] Comandos disponibles por Serial:");
         Serial.printf("  0 .. 100 -> Configura el %% de gas del botón pito (actual: %u%%)\n", UiManager::getBenchThrottlePercent());
         Serial.println("  b        -> Estado detallado BMS CamiAlfa");
         Serial.println("  l        -> Conmutar luces (ON / OFF)");
         Serial.println("  w        -> Activar WiFi para OTA");
+        Serial.println("  s        -> Sniffer UART: Captura 10 tramas Dash -> ESC");
         Serial.println("  p        -> Pulso encendido D14 (600ms)");
         Serial.println("  m        -> Doble clic simulado D14");
         return;

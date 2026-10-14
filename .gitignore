@@ -16,6 +16,7 @@ build/
 # Temporary and backup directories
 esp32ecutxct/
 scratch/
+esp32_ecu/*.txt
 
 # OS generated files
 Thumbs.db

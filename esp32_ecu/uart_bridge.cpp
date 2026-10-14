@@ -34,6 +34,76 @@ static uint32_t _lastCtrlActivity = 0;
 static uint8_t  _lastThrottlePct  = 0;
 static bool     _lastBrakeActive   = false;
 static uint8_t  _smoothedGas       = M365Protocol::M365_THROTTLE_REST;
+static uint8_t  _latestRawDemand   = M365Protocol::M365_THROTTLE_REST;
+static uint32_t _lastRampUpdateMs  = 0;
+static uint8_t  _snifferCount      = 0;
+
+void triggerSniffer(uint8_t count) {
+    _snifferCount = count;
+    Serial.printf("[SNIFFER] Capturando las próximas %u tramas de control (Dash -> ESC)...\n", count);
+}
+
+// ---------------------------------------------------------------------------
+// _updateRamp() — Slew-rate limiter de 2 etapas por tiempo (cada 20 ms)
+// ---------------------------------------------------------------------------
+static void _updateRamp(uint8_t targetScaledGas, uint32_t now) {
+    if (targetScaledGas <= M365Protocol::M365_THROTTLE_REST) {
+        // Seguridad: al soltar gas o frenar, caída instantánea en 0 ms
+        _smoothedGas = M365Protocol::M365_THROTTLE_REST;
+        _lastRampUpdateMs = now;
+    } else if (now - _lastRampUpdateMs >= 20) {
+        _lastRampUpdateMs = now;
+        if (_smoothedGas < targetScaledGas) {
+            // Etapa 1 (38..58 raw): +1 por paso (20ms) para enganche ultra-suave sin tirón
+            // Etapa 2 (59..210 raw): +2 por paso para aceleración progresiva
+            uint8_t step = (_smoothedGas < 58) ? 1 : 2;
+            uint16_t nextGas = (uint16_t)_smoothedGas + step;
+            _smoothedGas = (nextGas > targetScaledGas) ? targetScaledGas : (uint8_t)nextGas;
+        } else if (_smoothedGas > targetScaledGas) {
+            // Si se reduce el objetivo en caliente (ej. bajar de SPORT a ECO), ajuste suave de -3
+            uint8_t step = 3;
+            _smoothedGas = (_smoothedGas - targetScaledGas > step) ? (_smoothedGas - step) : targetScaledGas;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// _updateSlewRateLimiter() — Cálculo periódico independiente de objetivo y rampa
+// ---------------------------------------------------------------------------
+static void _updateSlewRateLimiter(uint32_t now) {
+    if (UiManager::isPitoActive()) {
+        _lastBrakeActive = false;
+    }
+
+    uint8_t rawDemand = _latestRawDemand;
+    uint8_t manualGas = M365Protocol::getThrottle();
+    if (manualGas > M365Protocol::M365_THROTTLE_REST) {
+        rawDemand = manualGas;
+    }
+
+    DriveMode mode = UiManager::getCurrentMode();
+    uint8_t targetScaledGas = M365Protocol::M365_THROTTLE_REST;
+    if (!_lastBrakeActive && rawDemand > M365Protocol::M365_THROTTLE_REST) {
+        if (M365Protocol::isDirectThrottleActive()) {
+            targetScaledGas = rawDemand;
+        } else {
+            uint16_t delta = rawDemand - M365Protocol::M365_THROTTLE_REST;
+            if (mode == MODE_ECO) {
+                targetScaledGas = M365Protocol::M365_THROTTLE_REST + (uint8_t)(delta * 55 / 100);
+            } else if (mode == MODE_DRIVE) {
+                targetScaledGas = M365Protocol::M365_THROTTLE_REST + (uint8_t)(delta * 78 / 100);
+            } else {
+                targetScaledGas = rawDemand;
+            }
+        }
+    }
+
+    _updateRamp(targetScaledGas, now);
+
+    constexpr uint16_t THROTTLE_SPAN = M365Protocol::M365_THROTTLE_MAX - M365Protocol::M365_THROTTLE_REST; // 172
+    _lastThrottlePct = (_smoothedGas > M365Protocol::M365_THROTTLE_REST) ?
+                       (uint8_t)(((uint16_t)(_smoothedGas - M365Protocol::M365_THROTTLE_REST) * 100) / THROTTLE_SPAN) : 0;
+}
 
 // Filtros de eco para bus monohilo (Half-Duplex 1-wire)
 static uint32_t _ctrlEchoExpected = 0;
@@ -134,6 +204,9 @@ bool isDashboardButtonPressed() {
 void update() {
     uint32_t now = millis();
     uint32_t nowMicros = micros();
+
+    // 0. Actualización periódica de rampa suave por tiempo
+    _updateSlewRateLimiter(now);
 
     // =========================================================================
     // 1. GESTIÓN DE LÍNEA P (D14): SIMULACIÓN DOBLE CLIC / PULSO MANUAL
@@ -271,6 +344,16 @@ void update() {
         _dashFramer.lastByteTime = now;
 
         uint8_t expectedTotal = _dashFramer.buf[2] + 6; // Total M365 = L + 6
+        if (expectedTotal < 8 || expectedTotal > sizeof(_dashFramer.buf)) {
+            for (uint8_t i = 0; i < _dashFramer.idx; i++) {
+                sCtrl->write(_dashFramer.buf[i]);
+                _ctrlEchoExpected++;
+            }
+            _lastTxCtrlTime = micros();
+            _dashFramer.reset();
+            continue;
+        }
+
         if (_dashFramer.idx == expectedTotal) {
             uint8_t* p = _dashFramer.buf;
             uint8_t totalLen = _dashFramer.idx;
@@ -282,28 +365,53 @@ void update() {
             uint16_t pktCk  = (uint16_t)p[totalLen - 2] | ((uint16_t)p[totalLen - 1] << 8);
 
             if (calcCk == pktCk && dest == 0x20) {
-                bool modified = false;
+                int8_t gasIdx = -1;
+                int8_t brakeIdx = -1;
 
-                // Emulación y escalado de acelerador según Modo de Conducción activo:
-                if ((cmd == 0x65 || cmd == 0x64) && totalLen >= 11) {
-                    DriveMode mode = UiManager::getCurrentMode();
-                    constexpr uint16_t THROTTLE_SPAN = M365Protocol::M365_THROTTLE_MAX - M365Protocol::M365_THROTTLE_REST; // 172
-
-                    // 1. Saneamiento de freno primero y detección de frenada activa
-                    if (p[8] < M365Protocol::M365_BRAKE_REST) {
-                        p[8] = M365Protocol::getBrake(); // Reposo seguro (0x26 = 38)
-                        modified = true;
+                if (cmd == 0x65 || cmd == 0x64) {
+                    if (totalLen == 10) {
+                        gasIdx = 6;
+                        brakeIdx = 7;
+                    } else if (totalLen >= 11) {
+                        gasIdx = 7;
+                        brakeIdx = 8;
                     }
-                    _lastBrakeActive = (p[8] > 50);
+                } else if (cmd == 0x61) {
+                    if (totalLen >= 12 && p[7] >= 0x02) {
+                        gasIdx = 8;
+                        brakeIdx = 9;
+                    }
+                }
 
-                    // 2. Determinar demanda de acelerador (maneta o botón pito)
-                    uint8_t rawDemand = p[7];
+                if (gasIdx != -1 && brakeIdx != -1) {
+                    bool modified = false;
+                    uint8_t origGas = p[gasIdx];
+                    uint8_t origBrake = p[brakeIdx];
+
+                    // Saneamiento de Freno:
+                    if (UiManager::isPitoActive()) {
+                        p[brakeIdx] = M365Protocol::M365_BRAKE_REST; // 0x26 = 38
+                        _lastBrakeActive = false;
+                    } else {
+                        if (p[brakeIdx] < M365Protocol::M365_BRAKE_REST) {
+                            p[brakeIdx] = M365Protocol::getBrake();
+                        }
+                        _lastBrakeActive = (p[brakeIdx] > 55);
+                    }
+
+                    // Demanda de Gas y Escalado por Modo (ECO 55%, DRIVE 78%, SPORT 100%):
+                    uint8_t rawDemand = p[gasIdx];
+                    if (rawDemand < M365Protocol::M365_THROTTLE_REST) {
+                        rawDemand = M365Protocol::M365_THROTTLE_REST;
+                    }
+                    _latestRawDemand = rawDemand;
+
                     uint8_t manualGas = M365Protocol::getThrottle();
                     if (manualGas > M365Protocol::M365_THROTTLE_REST) {
                         rawDemand = manualGas;
                     }
 
-                    // 3. Calcular objetivo escalado por modo (con prioridad absoluta de corte por freno)
+                    DriveMode mode = UiManager::getCurrentMode();
                     uint8_t targetScaledGas = M365Protocol::M365_THROTTLE_REST;
                     if (!_lastBrakeActive && rawDemand > M365Protocol::M365_THROTTLE_REST) {
                         if (M365Protocol::isDirectThrottleActive()) {
@@ -320,36 +428,34 @@ void update() {
                         }
                     }
 
-                    // 4. Rampa suave (Slew-Rate Limiter de 2 etapas en subida, corte instantáneo en bajada)
-                    if (targetScaledGas <= M365Protocol::M365_THROTTLE_REST) {
-                        // Seguridad: al soltar gas o frenar, caída instantánea en 0 ms
-                        _smoothedGas = M365Protocol::M365_THROTTLE_REST;
-                    } else if (_smoothedGas < targetScaledGas) {
-                        // Etapa 1 (38..58 raw): +1 por trama (~20ms) para enganche ultra-suave sin tirón
-                        // Etapa 2 (59..210 raw): +2 por trama para aceleración progresiva
-                        uint8_t step = (_smoothedGas < 58) ? 1 : 2;
-                        uint16_t nextGas = (uint16_t)_smoothedGas + step;
-                        _smoothedGas = (nextGas > targetScaledGas) ? targetScaledGas : (uint8_t)nextGas;
-                    } else if (_smoothedGas > targetScaledGas) {
-                        // Si se reduce el objetivo en caliente (ej. bajar de SPORT a ECO), ajuste suave de -3 por trama
-                        uint8_t step = 3;
-                        _smoothedGas = (_smoothedGas - targetScaledGas > step) ? (_smoothedGas - step) : targetScaledGas;
-                    }
+                    // Rampa suave temporizada (now - _lastRampUpdateMs >= 20)
+                    _updateRamp(targetScaledGas, now);
 
-                    if (p[7] != _smoothedGas) {
-                        p[7] = _smoothedGas;
+                    p[gasIdx] = _smoothedGas;
+
+                    if (p[gasIdx] != origGas || p[brakeIdx] != origBrake) {
                         modified = true;
                     }
 
-                    _lastThrottlePct = (p[7] > M365Protocol::M365_THROTTLE_REST) ?
-                                       (uint8_t)(((uint16_t)(p[7] - M365Protocol::M365_THROTTLE_REST) * 100) / THROTTLE_SPAN) : 0;
-                }
+                    constexpr uint16_t THROTTLE_SPAN = M365Protocol::M365_THROTTLE_MAX - M365Protocol::M365_THROTTLE_REST; // 172
+                    _lastThrottlePct = (_smoothedGas > M365Protocol::M365_THROTTLE_REST) ?
+                                       (uint8_t)(((uint16_t)(_smoothedGas - M365Protocol::M365_THROTTLE_REST) * 100) / THROTTLE_SPAN) : 0;
 
-                if (modified) {
-                    _pktsSanitized++;
-                    uint16_t newCk = M365Protocol::calcChecksum(&p[2], p[2] + 2);
-                    p[totalLen - 2] = (uint8_t)(newCk & 0xFF);
-                    p[totalLen - 1] = (uint8_t)((newCk >> 8) & 0xFF);
+                    if (modified) {
+                        _pktsSanitized++;
+                        uint16_t newCk = M365Protocol::calcChecksum(&p[2], p[2] + 2);
+                        p[totalLen - 2] = (uint8_t)(newCk & 0xFF);
+                        p[totalLen - 1] = (uint8_t)((newCk >> 8) & 0xFF);
+                    }
+
+                    if (_snifferCount > 0) {
+                        _snifferCount--;
+                        Serial.printf("[SNIFFER] CMD:0x%02X Len:%u | GasIdx:%d (Orig:0x%02X -> Iny:0x%02X [%u%%]) | BrkIdx:%d (Orig:0x%02X -> Iny:0x%02X) | CK:0x%02X%02X\n",
+                                      cmd, totalLen,
+                                      gasIdx, origGas, p[gasIdx], _lastThrottlePct,
+                                      brakeIdx, origBrake, p[brakeIdx],
+                                      p[totalLen - 1], p[totalLen - 2]);
+                    }
                 }
             }
 
@@ -427,6 +533,16 @@ void update() {
         _ctrlFramer.lastByteTime = now;
 
         uint8_t expectedTotal = _ctrlFramer.buf[2] + 6; // Total M365 = L + 6
+        if (expectedTotal < 8 || expectedTotal > sizeof(_ctrlFramer.buf)) {
+            for (uint8_t i = 0; i < _ctrlFramer.idx; i++) {
+                sDash->write(_ctrlFramer.buf[i]);
+                _dashEchoExpected++;
+            }
+            _lastTxDashTime = micros();
+            _ctrlFramer.reset();
+            continue;
+        }
+
         if (_ctrlFramer.idx == expectedTotal) {
             uint8_t* p = _ctrlFramer.buf;
             uint8_t totalLen = _ctrlFramer.idx;

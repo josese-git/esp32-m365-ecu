@@ -38,4 +38,7 @@ namespace UartBridge {
     bool     isControllerActive();
     uint8_t  getLastThrottlePercent();
     bool     isBrakeActive();
+
+    // Activa la impresión en HEX de las próximas N tramas de control (Dash -> ESC)
+    void triggerSniffer(uint8_t count = 10);
 }
