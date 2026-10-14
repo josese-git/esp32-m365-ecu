@@ -1,0 +1,23 @@
+# Arduino / PlatformIO / Build artifacts
+build/
+.pio/
+*.bin
+*.elf
+*.hex
+*.map
+
+# Editor and IDE configurations
+.vscode/
+.idea/
+*.swp
+*.bak
+*~
+
+# Temporary and backup directories
+esp32ecutxct/
+scratch/
+
+# OS generated files
+Thumbs.db
+Desktop.ini
+.DS_Store
